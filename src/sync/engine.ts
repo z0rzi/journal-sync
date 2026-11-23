@@ -1,9 +1,11 @@
 import git, { TREE, type HttpClient, type PromiseFsClient } from 'isomorphic-git';
+import type { Versions } from '../merge/lines';
 import { mergeNote } from '../merge/note';
 
 const BRANCH = 'master';
-const REMOTE_REF = `refs/remotes/origin/${BRANCH}`;
-const MAX_ATTEMPTS = 3;
+const REMOTE_BRANCH = `refs/remotes/origin/${BRANCH}`;
+/** Times the cycle runs again when GitHub rejects the push because the other device pushed first. */
+const MAX_RETRIES = 3;
 
 export interface EngineOptions {
 	fs: PromiseFsClient;
@@ -18,26 +20,22 @@ export interface EngineOptions {
 	/** Raw template a note at this path is created from, if any. */
 	templateFor: (path: string) => Promise<string | null>;
 	now?: () => Date;
-	/** Called before the engine writes or deletes a vault file. */
-	onWrite?: (path: string) => void;
 }
 
 export type Outcome = 'up-to-date' | 'pushed' | 'pulled' | 'merged';
 
 export interface SyncReport {
 	outcome: Outcome;
-	/** Files changed by bringing in the other device's commits. */
-	pulledFiles: string[];
-	/** Files both devices changed, merged automatically. */
-	mergedFiles: string[];
-	/** Merged files where at least one Section was Stacked. */
+	/** Notes where at least one Section was Stacked. */
 	stackedFiles: string[];
-	/** Copies written as `name (<device>).ext` for non-note files changed on both sides. */
+	/** Copies written as `name (<device>).ext` for other files both devices changed. */
 	conflictCopies: string[];
 }
 
-type Change = 'added' | 'modified' | 'deleted';
+/** File content; null when the file doesn't exist. */
+type Content = Uint8Array | null;
 
+/** The few file operations the engine does itself, beyond isomorphic-git's. */
 interface Files {
 	readFile(path: string): Promise<Uint8Array | string>;
 	writeFile(path: string, data: Uint8Array): Promise<void>;
@@ -46,383 +44,266 @@ interface Files {
 }
 
 export class SyncEngine {
-	private readonly o: EngineOptions;
-
-	constructor(options: EngineOptions) {
-		this.o = options;
-	}
-
-	/** The few file operations the engine does itself, beyond what isomorphic-git does. */
-	private get files(): Files {
-		return this.o.fs.promises as unknown as Files;
-	}
-
-	private get repo() {
-		return { fs: this.o.fs, dir: this.o.dir };
-	}
+	constructor(private readonly options: EngineOptions) {}
 
 	/** Commit this device's changes, bring in the other device's, push the result. */
 	async sync(): Promise<SyncReport> {
-		const report = emptyReport();
-		await this.commitAll(`sync ${this.o.device}: ${stamp(this.now())}`);
-		for (let attempt = 1; ; attempt++) {
-			await this.fetch();
-			const local = await this.head();
-			const remote = await this.resolve(REMOTE_REF);
+		const report = newReport();
+		await this.commitPending();
+		for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+			const { local, remote } = await this.fetch();
 			if (local === remote) return report;
-
-			if (remote !== null && (await this.isAncestor(local, remote))) {
+			if (await this.isAncestor(local, remote)) {
 				await this.fastForward(local, remote, report);
 				return { ...report, outcome: 'pulled' };
 			}
-			if (remote !== null && !(await this.isAncestor(remote, local))) {
+			if (await this.isAncestor(remote, local)) {
+				report.outcome = 'pushed';
+			} else {
 				await this.mergeWith(local, remote, report);
 				report.outcome = 'merged';
-			} else {
-				report.outcome = 'pushed';
 			}
 			if (await this.push()) return report;
-			if (attempt >= MAX_ATTEMPTS) throw new Error('GitHub kept rejecting the push');
 		}
+		throw new Error('GitHub kept rejecting the push');
 	}
 
-	/** Bring in the other device's changes, leaving this device's pending edits uncommitted. */
+	/** Bring in the other device's changes without committing this device's pending edits. */
 	async pull(): Promise<SyncReport> {
-		await this.fetch();
-		const local = await this.head();
-		const remote = await this.resolve(REMOTE_REF);
-		if (local === remote || remote === null) return emptyReport();
+		const report = newReport();
+		const { local, remote } = await this.fetch();
+		if (local === remote) return report;
 		if (await this.isAncestor(local, remote)) {
-			const report = emptyReport();
 			await this.fastForward(local, remote, report);
 			return { ...report, outcome: 'pulled' };
 		}
-		// Local commits are waiting (an earlier push failed): a full sync handles both sides.
+		// Commits from an earlier, failed push are waiting.
+		if ((await this.isAncestor(remote, local)) && (await this.push())) return { ...report, outcome: 'pushed' };
+		// Both sides have commits: only a full Sync can join them.
 		return this.sync();
 	}
 
-	/** True when the vault has edits not yet committed. */
-	async hasPendingChanges(): Promise<boolean> {
-		return (await this.pendingRows()).length > 0;
-	}
+	// --- the steps ---------------------------------------------------------
 
-	// --- steps -------------------------------------------------------------
-
-	private async commitAll(message: string): Promise<boolean> {
-		const rows = await this.pendingRows();
-		if (!rows.length) return false;
-		for (const [filepath, , workdir] of rows) {
+	private async commitPending(): Promise<void> {
+		const matrix = await git.statusMatrix(this.repo);
+		const pending = matrix.filter(([, head, workdir, stage]) => !(head === 1 && workdir === 1 && stage === 1));
+		if (!pending.length) return;
+		for (const [filepath, , workdir] of pending) {
 			if (workdir === 0) await git.remove({ ...this.repo, filepath });
 			else await git.add({ ...this.repo, filepath });
 		}
-		await git.commit({ ...this.repo, message, author: this.author() });
-		return true;
+		await git.commit({ ...this.repo, message: syncMessage(this.options.device, this.now()), author: this.author() });
 	}
 
-	private async pendingRows() {
-		const matrix = await git.statusMatrix({ ...this.repo });
-		return matrix.filter(([, h, w, s]) => !(h === 1 && w === 1 && s === 1));
-	}
-
-	/** Move to the remote commit, merging into any file edited here since `local`. */
+	/** Move to the remote commit. Pending edits stay on disk, merged, and uncommitted. */
 	private async fastForward(local: string, remote: string, report: SyncReport): Promise<void> {
-		const theirsDevice = await this.deviceOf(remote);
-		for (const [path, change] of await this.changes(local, remote)) {
-			report.pulledFiles.push(path);
-			const committed = await this.readAt(local, path);
-			const disk = await this.readDisk(path);
-			const theirs = change === 'deleted' ? null : await this.readAt(remote, path);
-			const blobOid = theirs === null ? null : await this.blobOid(remote, path);
-
-			if (disk !== null && !sameBytes(disk, committed)) {
-				// Edited here and not committed yet: keep the edit, merged with theirs.
-				const merged = await this.mergeFile(path, committed, disk, theirs, theirsDevice, report);
-				await this.writeDisk(path, merged);
-			} else {
-				// Unchanged here, or deleted here while the other device edited it: theirs wins.
-				await this.writeDisk(path, theirs);
-			}
-
-			if (blobOid === null) await git.remove({ ...this.repo, filepath: path });
-			else await git.updateIndex({ ...this.repo, filepath: path, oid: blobOid, add: true });
+		for (const path of await this.bringIn(local, remote, report)) {
+			const blob = await this.readAt(remote, path);
+			if (blob) await git.updateIndex({ ...this.repo, filepath: path, oid: blob.oid, add: true });
+			else await git.remove({ ...this.repo, filepath: path });
 		}
 		await git.writeRef({ ...this.repo, ref: `refs/heads/${BRANCH}`, value: remote, force: true });
 	}
 
 	/** Join both histories with a merge commit (ADR 0004). */
 	private async mergeWith(local: string, remote: string, report: SyncReport): Promise<void> {
-		const bases = (await git.findMergeBase({ ...this.repo, oids: [local, remote] })) as string[];
-		const baseOid = bases[0] ?? null;
-		const theirsDevice = await this.deviceOf(remote);
-		const ours = baseOid ? await this.changes(baseOid, local) : new Map<string, Change>();
-		const theirs = baseOid ? await this.changes(baseOid, remote) : await this.changes(null, remote);
-
-		for (const path of theirs.keys()) {
-			const theirsContent = await this.readAt(remote, path);
-			if (!ours.has(path)) {
-				report.pulledFiles.push(path);
-				const committed = await this.readAt(local, path);
-				const disk = await this.readDisk(path);
-				if (disk !== null && !sameBytes(disk, committed)) {
-					// Typed into since the commit: merge the typing in rather than overwrite it.
-					const merged = await this.mergeFile(path, committed, disk, theirsContent, theirsDevice, report);
-					await this.writeDisk(path, merged);
-				} else {
-					await this.writeDisk(path, theirsContent);
-				}
-			} else {
-				const baseContent = baseOid ? await this.readAt(baseOid, path) : null;
-				// Re-read the disk: the user may have typed since the commit.
-				const oursContent = await this.readDisk(path);
-				if (sameBytes(oursContent, theirsContent)) continue;
-				const merged = await this.mergeFile(path, baseContent, oursContent, theirsContent, theirsDevice, report);
-				await this.writeDisk(path, merged);
-			}
-			await this.stage(path);
-		}
-		for (const copy of report.conflictCopies) await this.stage(copy);
-
+		const [base] = (await git.findMergeBase({ ...this.repo, oids: [local, remote] })) as string[];
+		for (const path of await this.bringIn(base ?? null, remote, report)) await this.stage(path);
+		for (const path of report.conflictCopies) await this.stage(path);
 		await git.commit({
 			...this.repo,
-			message: `sync ${this.o.device}: ${stamp(this.now())} (merge)`,
+			message: syncMessage(this.options.device, this.now(), 'merge'),
 			author: this.author(),
 			parent: [local, remote],
 		});
 	}
 
-	/** Result for a file both sides touched; null means deleted. */
-	private async mergeFile(
-		path: string,
-		base: Uint8Array | null,
-		ours: Uint8Array | null,
-		theirs: Uint8Array | null,
-		theirsDevice: string,
-		report: SyncReport,
-	): Promise<Uint8Array | null> {
-		// An edit always wins over a deletion.
-		if (ours === null) return theirs !== null && !sameBytes(theirs, base) ? theirs : null;
-		if (theirs === null) return ours;
-		if (sameBytes(ours, theirs)) return ours;
+	/**
+	 * Write to disk every file the remote changed since `base`, merged with what
+	 * is on disk now: that covers this device's commits and anything typed
+	 * since. Returns the paths it looked at.
+	 */
+	private async bringIn(base: string | null, remote: string, report: SyncReport): Promise<string[]> {
+		const theirsDevice = deviceFromMessage((await git.readCommit({ ...this.repo, oid: remote })).commit.message);
+		const paths = await this.changedPaths(base, remote);
+		for (const path of paths) {
+			const disk = await this.readDisk(path);
+			const merged = await this.mergeFile(path, theirsDevice, report, {
+				base: base === null ? null : ((await this.readAt(base, path))?.blob ?? null),
+				ours: disk,
+				theirs: (await this.readAt(remote, path))?.blob ?? null,
+			});
+			if (!sameContent(merged, disk)) await this.writeDisk(path, merged);
+		}
+		return paths;
+	}
 
-		report.mergedFiles.push(path);
+	private async mergeFile(path: string, theirsDevice: string, report: SyncReport, v: Versions<Content>): Promise<Content> {
+		if (sameContent(v.ours, v.base) || sameContent(v.ours, v.theirs)) return v.theirs;
+		if (sameContent(v.theirs, v.base)) return v.ours;
+		// An edit always wins over a deletion.
+		if (v.ours === null || v.theirs === null) return v.ours ?? v.theirs;
+
 		if (!path.endsWith('.md')) {
 			const copy = conflictCopyPath(path, theirsDevice);
-			await this.writeDisk(copy, theirs);
+			await this.writeDisk(copy, v.theirs);
 			report.conflictCopies.push(copy);
-			return ours;
+			return v.ours;
 		}
 		const result = mergeNote(
-			{ base: base === null ? null : decode(base), ours: decode(ours), theirs: decode(theirs) },
-			{ template: await this.o.templateFor(path), oursDevice: this.o.device, theirsDevice },
+			{ base: v.base === null ? null : decode(v.base), ours: decode(v.ours), theirs: decode(v.theirs) },
+			{ template: await this.options.templateFor(path), oursDevice: this.options.device, theirsDevice },
 		);
 		if (result.stacked) report.stackedFiles.push(path);
 		return encode(result.text);
 	}
 
-	// --- git plumbing ------------------------------------------------------
+	// --- git ---------------------------------------------------------------
 
-	private async fetch(): Promise<void> {
-		await git.fetch({
-			...this.repo,
-			http: this.o.http,
-			url: this.o.url,
+	private get repo() {
+		return { fs: this.options.fs, dir: this.options.dir };
+	}
+
+	private get remote() {
+		return {
+			http: this.options.http,
+			url: this.options.url,
 			remote: 'origin',
-			ref: BRANCH,
-			singleBranch: true,
-			tags: false,
-			onAuth: () => this.auth(),
-		});
+			onAuth: () => ({ username: 'x-access-token', password: this.options.token }),
+		};
+	}
+
+	private async fetch(): Promise<{ local: string; remote: string }> {
+		await git.fetch({ ...this.repo, ...this.remote, ref: BRANCH, singleBranch: true, tags: false });
+		const [local, remote] = await Promise.all([BRANCH, REMOTE_BRANCH].map((ref) => git.resolveRef({ ...this.repo, ref })));
+		return { local: local as string, remote: remote as string };
 	}
 
 	/** Push; false when GitHub rejected it because the other device pushed first. */
 	private async push(): Promise<boolean> {
 		try {
-			const result = await git.push({
-				...this.repo,
-				http: this.o.http,
-				url: this.o.url,
-				remote: 'origin',
-				ref: BRANCH,
-				remoteRef: BRANCH,
-				onAuth: () => this.auth(),
-			});
+			const result = await git.push({ ...this.repo, ...this.remote, ref: BRANCH, remoteRef: BRANCH });
 			if (!result.ok) return false;
 		} catch (e) {
-			if (isRejection(e)) return false;
+			const code = (e as { code?: string }).code;
+			if (code === 'PushRejectedError' || code === 'GitPushError') return false;
 			throw e;
 		}
-		const local = await this.resolve(BRANCH);
-		if (local) await git.writeRef({ ...this.repo, ref: REMOTE_REF, value: local, force: true });
+		const local = await git.resolveRef({ ...this.repo, ref: BRANCH });
+		await git.writeRef({ ...this.repo, ref: REMOTE_BRANCH, value: local, force: true });
 		return true;
 	}
 
-	private auth() {
-		return { username: 'x-access-token', password: this.o.token };
-	}
-
-	private async resolve(ref: string): Promise<string | null> {
-		try {
-			return await git.resolveRef({ ...this.repo, ref });
-		} catch {
-			return null;
-		}
-	}
-
-	private async head(): Promise<string> {
-		const oid = await this.resolve(BRANCH);
-		if (oid === null) throw new Error(`the vault repository has no ${BRANCH} branch`);
-		return oid;
-	}
-
+	/** True when `ancestor` is `oid` or comes before it. */
 	private async isAncestor(ancestor: string, oid: string): Promise<boolean> {
-		if (ancestor === oid) return true;
-		return git.isDescendent({ ...this.repo, oid, ancestor, depth: -1 });
+		return ancestor === oid || git.isDescendent({ ...this.repo, oid, ancestor, depth: -1 });
 	}
 
-	/** Files that differ between two commits (null `from` means the empty tree). */
-	private async changes(from: string | null, to: string): Promise<Map<string, Change>> {
-		const result = new Map<string, Change>();
+	/** Files that differ between two commits; a null `from` is the empty tree. */
+	private async changedPaths(from: string | null, to: string): Promise<string[]> {
+		const changed: string[] = [];
 		const trees = from === null ? [TREE({ ref: to })] : [TREE({ ref: from }), TREE({ ref: to })];
 		await git.walk({
 			...this.repo,
 			trees,
 			map: async (filepath, entries) => {
-				if (filepath === '.') return true;
 				const [a, b] = from === null ? [null, entries[0]] : entries;
-				const aType = a ? await a.type() : undefined;
-				const bType = b ? await b.type() : undefined;
+				const [aType, bType] = [await a?.type(), await b?.type()];
 				if (aType === 'tree' || bType === 'tree') {
-					// Recurse; a file replaced by a folder (or the reverse) shows as its leaves.
-					if (aType === 'blob') result.set(filepath, 'deleted');
-					if (bType === 'blob') result.set(filepath, 'added');
+					// A file replaced by a folder, or the reverse, changes at this path too.
+					if (filepath !== '.' && (aType === 'blob' || bType === 'blob')) changed.push(filepath);
 					return true;
 				}
-				const aOid = a && aType === 'blob' ? await a.oid() : undefined;
-				const bOid = b && bType === 'blob' ? await b.oid() : undefined;
-				if (aOid === bOid) return false;
-				result.set(filepath, aOid === undefined ? 'added' : bOid === undefined ? 'deleted' : 'modified');
+				if ((await a?.oid()) !== (await b?.oid())) changed.push(filepath);
 				return false;
 			},
 		});
-		return result;
+		return changed;
 	}
 
-	private async readAt(commit: string, filepath: string): Promise<Uint8Array | null> {
+	private async readAt(commit: string, filepath: string): Promise<{ oid: string; blob: Uint8Array } | null> {
 		try {
-			return (await git.readBlob({ ...this.repo, oid: commit, filepath })).blob;
+			return await git.readBlob({ ...this.repo, oid: commit, filepath });
 		} catch {
 			return null;
 		}
-	}
-
-	private async blobOid(commit: string, filepath: string): Promise<string | null> {
-		try {
-			return (await git.readBlob({ ...this.repo, oid: commit, filepath })).oid;
-		} catch {
-			return null;
-		}
-	}
-
-	private async deviceOf(commit: string): Promise<string> {
-		const { commit: c } = await git.readCommit({ ...this.repo, oid: commit });
-		return /^sync (.+?): /.exec(c.message)?.[1] ?? 'other device';
 	}
 
 	private async stage(path: string): Promise<void> {
-		if ((await this.readDisk(path)) === null) {
-			await git.remove({ ...this.repo, filepath: path });
-		} else {
-			await git.add({ ...this.repo, filepath: path });
-		}
+		if ((await this.readDisk(path)) === null) await git.remove({ ...this.repo, filepath: path });
+		else await git.add({ ...this.repo, filepath: path });
 	}
 
-	// --- working tree ------------------------------------------------------
-
-	private full(path: string): string {
-		return `${this.o.dir.replace(/\/$/, '')}/${path}`;
+	private author() {
+		const now = this.now();
+		return { ...this.options.author, timestamp: Math.floor(now.getTime() / 1000), timezoneOffset: now.getTimezoneOffset() };
 	}
 
-	private async readDisk(path: string): Promise<Uint8Array | null> {
+	private now(): Date {
+		return this.options.now?.() ?? new Date();
+	}
+
+	// --- the working tree --------------------------------------------------
+
+	private get files(): Files {
+		return this.options.fs.promises as unknown as Files;
+	}
+
+	private pathOnDisk(path: string): string {
+		return `${this.options.dir.replace(/\/$/, '')}/${path}`;
+	}
+
+	private async readDisk(path: string): Promise<Content> {
 		try {
-			const data = await this.files.readFile(this.full(path));
+			const data = await this.files.readFile(this.pathOnDisk(path));
 			return typeof data === 'string' ? encode(data) : new Uint8Array(data);
 		} catch {
 			return null;
 		}
 	}
 
-	private async writeDisk(path: string, content: Uint8Array | null): Promise<void> {
-		this.o.onWrite?.(path);
-		const fsp = this.files;
+	private async writeDisk(path: string, content: Content): Promise<void> {
 		if (content === null) {
-			try {
-				await fsp.unlink(this.full(path));
-			} catch {
-				// Already gone.
-			}
+			await this.files.unlink(this.pathOnDisk(path)).catch(() => undefined);
 			return;
 		}
-		await this.mkdirs(path);
-		await fsp.writeFile(this.full(path), content);
-	}
-
-	private async mkdirs(path: string): Promise<void> {
-		const parts = path.split('/').slice(0, -1);
-		for (let i = 1; i <= parts.length; i++) {
-			try {
-				await this.files.mkdir(this.full(parts.slice(0, i).join('/')));
-			} catch {
-				// Exists.
-			}
+		const folders = path.split('/').slice(0, -1);
+		for (let i = 1; i <= folders.length; i++) {
+			await this.files.mkdir(this.pathOnDisk(folders.slice(0, i).join('/'))).catch(() => undefined);
 		}
-	}
-
-	private author() {
-		const now = this.now();
-		return {
-			...this.o.author,
-			timestamp: Math.floor(now.getTime() / 1000),
-			timezoneOffset: now.getTimezoneOffset(),
-		};
-	}
-
-	private now(): Date {
-		return this.o.now?.() ?? new Date();
+		await this.files.writeFile(this.pathOnDisk(path), content);
 	}
 }
 
-function emptyReport(): SyncReport {
-	return { outcome: 'up-to-date', pulledFiles: [], mergedFiles: [], stackedFiles: [], conflictCopies: [] };
-}
+// --- commit messages: how each device learns the other one's name ----------
 
-function stamp(d: Date): string {
+function syncMessage(device: string, date: Date, kind?: 'merge'): string {
 	const p = (n: number) => String(n).padStart(2, '0');
-	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+	const stamp = `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
+	return `sync ${device}: ${stamp}${kind ? ` (${kind})` : ''}`;
+}
+
+function deviceFromMessage(message: string): string {
+	return /^sync (.+?): /.exec(message)?.[1] ?? 'other device';
+}
+
+// --- helpers ----------------------------------------------------------------
+
+function newReport(): SyncReport {
+	return { outcome: 'up-to-date', stackedFiles: [], conflictCopies: [] };
 }
 
 function conflictCopyPath(path: string, device: string): string {
-	const slash = path.lastIndexOf('/');
 	const dot = path.lastIndexOf('.');
-	return dot > slash + 1 ? `${path.slice(0, dot)} (${device})${path.slice(dot)}` : `${path} (${device})`;
+	const hasExtension = dot > path.lastIndexOf('/') + 1;
+	return hasExtension ? `${path.slice(0, dot)} (${device})${path.slice(dot)}` : `${path} (${device})`;
 }
 
-function isRejection(e: unknown): boolean {
-	const code = (e as { code?: string } | null)?.code;
-	return code === 'PushRejectedError' || code === 'GitPushError';
-}
-
-function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+function sameContent(a: Content, b: Content): boolean {
 	if (a === null || b === null) return a === b;
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
+	return a.length === b.length && a.every((byte, i) => byte === b[i]);
 }
 
-const decoder = new TextDecoder();
-const encoder = new TextEncoder();
-function decode(b: Uint8Array): string {
-	return decoder.decode(b);
-}
-function encode(s: string): Uint8Array {
-	return encoder.encode(s);
-}
+const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+const encode = (text: string) => new TextEncoder().encode(text);

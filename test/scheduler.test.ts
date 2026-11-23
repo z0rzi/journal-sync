@@ -56,10 +56,10 @@ describe('Scheduler', () => {
 	});
 
 	it('syncs right away when the app goes to the background with pending edits', async () => {
-		scheduler.backgrounded();
+		void scheduler.backgrounded();
 		expect(runs).toEqual([]);
 		scheduler.edited();
-		scheduler.backgrounded();
+		void scheduler.backgrounded();
 		expect(runs).toEqual(['sync']);
 		await finish();
 		await vi.advanceTimersByTimeAsync(10 * MIN);
@@ -67,14 +67,25 @@ describe('Scheduler', () => {
 	});
 
 	it('runs one job at a time and queues a single follow-up, a sync beating a pull', async () => {
-		scheduler.request('pull');
-		scheduler.request('pull');
-		scheduler.request('sync');
-		scheduler.request('pull');
+		void scheduler.request('pull');
+		void scheduler.request('pull');
+		void scheduler.request('sync');
+		void scheduler.request('pull');
 		expect(runs).toEqual(['pull']);
 		await finish();
 		expect(runs).toEqual(['pull', 'sync']);
 		await finish();
 		expect(runs).toEqual(['pull', 'sync']);
+	});
+
+	it('resolves a request once the job covering it has run, even when it had to wait', async () => {
+		let firstDone = false;
+		let secondDone = false;
+		void scheduler.request('pull').then(() => (firstDone = true));
+		void scheduler.request('sync').then(() => (secondDone = true));
+		await finish();
+		expect([firstDone, secondDone]).toEqual([true, false]);
+		await finish();
+		expect(secondDone).toBe(true);
 	});
 });

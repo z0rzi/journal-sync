@@ -27,7 +27,8 @@ The vault must already be a clone of the journal repository (it is on both devic
 
 ```
 npm install
-npm test        # merge rules, scheduler, and full sync cycles against a local git server
+npm test        # merge rules, scheduler, and full two-device sync cycles against a local git server,
+                # over both the desktop's and the phone's file layer
 npm run build
 npm run lint
 ```

@@ -1,7 +1,7 @@
 {
 	"id": "journal-sync",
 	"name": "Journal Sync",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"minAppVersion": "1.11.4",
 	"description": "Git sync for the journal vault: commit and push after a quiet period, pull on a timer and on app focus, merge notes section by section.",
 	"isDesktopOnly": false

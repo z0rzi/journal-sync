@@ -1,14 +1,8 @@
-import { mergeLines } from './lines';
-import { codeBlocks, parseNote, renderNote, type ParsedNote, type Section } from './parse';
+import { mergeLines, type Versions } from './lines';
+import { codeBlocks, parseNote, removeCodeBlocks, renderNote, type Note, type Section } from './parse';
 
-export interface NoteVersions {
-	/** The common ancestor, or null when both devices created the note. */
-	base: string | null;
-	/** This device's version. */
-	ours: string;
-	/** The version already on GitHub. */
-	theirs: string;
-}
+/** A note's three versions; `base` is null when both devices created the note. */
+export type NoteVersions = Versions<string, string | null>;
 
 export interface MergeContext {
 	/** Raw template the note was created from, if any. */
@@ -23,88 +17,97 @@ export interface NoteMergeResult {
 	stacked: boolean;
 }
 
-type Pick = 'ours' | 'theirs' | 'other';
-
-/** Merge two versions of a Markdown note, never leaving conflict markers (ADR 0002). */
+/** Merge two versions of a Markdown note without ever writing conflict markers (ADR 0002). */
 export function mergeNote(v: NoteVersions, ctx: MergeContext): NoteMergeResult {
 	if (v.ours === v.theirs) return { text: v.theirs, stacked: false };
-	const clean = mergeLines(v.base ?? '', v.ours, v.theirs);
-	if (clean !== null) return { text: clean, stacked: false };
+	const clean = mergeLines({ base: v.base ?? '', ours: v.ours, theirs: v.theirs });
+	if (clean !== null) return { text: withoutExtraCodeBlocks(clean, v), stacked: false };
 
-	const base = v.base === null ? null : parseNote(v.base);
-	const ours = parseNote(v.ours);
-	const theirs = parseNote(v.theirs);
-	const template = ctx.template === null ? null : parseNote(ctx.template);
+	const merger = new SectionMerger(ctx);
+	const note = merger.merge({
+		base: v.base === null ? null : parseNote(v.base),
+		ours: parseNote(v.ours),
+		theirs: parseNote(v.theirs),
+	});
+	const text = renderNote(note);
+	// Prefer a side's exact text when the merge changed nothing of it.
+	if (text === renderNote(parseNote(v.theirs))) return { text: v.theirs, stacked: false };
+	if (text === renderNote(parseNote(v.ours))) return { text: v.ours, stacked: false };
+	return { text: withoutExtraCodeBlocks(text, v), stacked: merger.stacked };
+}
 
-	const picks: Pick[] = [];
-	let stacked = false;
-	const pick = (p: Pick) => picks.push(p);
+/** The Device marker above each version of a Stacked Section. */
+function deviceMarker(device: string): string {
+	return `*— ${device} —*`;
+}
 
-	const frontmatter = mergeFrontmatter(base?.frontmatter ?? null, ours.frontmatter, theirs.frontmatter, pick);
+class SectionMerger {
+	stacked = false;
+	private template: Note | null;
 
-	const blank = (key: string | null, body: string): boolean => {
-		if (body === '') return true;
-		if (!template) return false;
-		const t = key === null ? template.preamble : template.sections.find((s) => s.key === key)?.body;
-		return t !== undefined && t === body;
-	};
+	constructor(private readonly ctx: MergeContext) {
+		this.template = ctx.template === null ? null : parseNote(ctx.template);
+	}
 
-	const mergeBody = (key: string | null, b: string | undefined, o: string, t: string): string => {
-		if (o === t) return t;
-		if (blank(key, o)) return (pick('theirs'), t);
-		if (blank(key, t)) return (pick('ours'), o);
-		if (b !== undefined && o === b) return (pick('theirs'), t);
-		if (b !== undefined && t === b) return (pick('ours'), o);
-		pick('other');
-		const merged = mergeLines(b ?? '', o, t);
-		if (merged !== null) return merged;
-		stacked = true;
-		return stack(t, o, ctx);
-	};
-
-	const preamble = mergeBody(null, base?.preamble, ours.preamble, theirs.preamble);
-
-	const baseSections = new Map(base?.sections.map((s) => [s.key, s]) ?? []);
-	const oursSections = new Map(ours.sections.map((s) => [s.key, s]));
-	const theirsSections = new Map(theirs.sections.map((s) => [s.key, s]));
-	const sections: Section[] = [];
-	for (const key of mergeOrder(
-		theirs.sections.map((s) => s.key),
-		ours.sections.map((s) => s.key),
-	)) {
-		const b = baseSections.get(key);
-		const o = oursSections.get(key);
-		const t = theirsSections.get(key);
-		if (o && t) {
-			sections.push({ ...t, body: mergeBody(key, b?.body, o.body, t.body) });
-			continue;
+	merge(v: Versions<Note, Note | null>): Note {
+		const sections: Section[] = [];
+		const base = byKey(v.base?.sections ?? []);
+		const ours = byKey(v.ours.sections);
+		const theirs = byKey(v.theirs.sections);
+		for (const key of mergeOrder([...theirs.keys()], [...ours.keys()])) {
+			const body = this.mergeBody(key, { base: base.get(key)?.body, ours: ours.get(key)?.body, theirs: theirs.get(key)?.body });
+			const heading = (theirs.get(key) ?? ours.get(key))?.heading;
+			if (body !== undefined && heading !== undefined) sections.push({ key, heading, body });
 		}
-		// Present on one side only: added there, or deleted on the other side.
-		// A deletion wins only over an unchanged section.
-		const only = (o ?? t) as Section;
-		const deletedOnOtherSide = b !== undefined && b.body === only.body;
-		pick(deletedOnOtherSide === Boolean(o) ? 'theirs' : 'ours');
-		if (!deletedOnOtherSide) sections.push(only);
+		return {
+			frontmatter: mergeFrontmatter(v.base?.frontmatter ?? null, v.ours.frontmatter, v.theirs.frontmatter),
+			preamble: this.mergeBody(null, { base: v.base?.preamble, ours: v.ours.preamble, theirs: v.theirs.preamble }) ?? '',
+			sections,
+		};
 	}
 
-	if (picks.every((p) => p === 'theirs')) return { text: v.theirs, stacked: false };
-	if (picks.every((p) => p === 'ours')) return { text: v.ours, stacked: false };
-
-	const merged: ParsedNote = { frontmatter, preamble, sections };
-	return { text: dedupeCodeBlocks(renderNote(merged), v.ours, v.theirs), stacked };
-}
-
-function stack(first: string, second: string, ctx: MergeContext): string {
-	const known = new Set(codeBlocks(first).map((b) => b.text));
-	const secondLines = second.split('\n');
-	for (const block of codeBlocks(second).reverse()) {
-		if (known.has(block.text)) secondLines.splice(block.start, block.end - block.start + 1);
+	/**
+	 * One Section's text (null key: the Preamble), following the spec's rules in
+	 * order. Undefined means the Section is absent from the result.
+	 */
+	private mergeBody(key: string | null, { base, ours, theirs }: Versions<string | undefined>): string | undefined {
+		if (ours === theirs) return theirs;
+		if (ours === undefined || theirs === undefined) {
+			// Deleted on one side: the deletion wins only over an unchanged Section.
+			const kept = ours ?? theirs;
+			return kept === base ? undefined : kept;
+		}
+		if (this.isBlank(key, ours)) return theirs;
+		if (this.isBlank(key, theirs)) return ours;
+		if (ours === base) return theirs;
+		if (theirs === base) return ours;
+		const merged = mergeLines({ base: base ?? '', ours, theirs });
+		if (merged !== null) return merged;
+		this.stacked = true;
+		return this.stack(theirs, ours);
 	}
-	const rest = secondLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-	return `*— ${ctx.theirsDevice} —*\n${first}\n\n*— ${ctx.oursDevice} —*\n${rest}`;
+
+	/** Empty, or still exactly the template's text. Templater code can't be matched, so it never is. */
+	private isBlank(key: string | null, body: string): boolean {
+		if (body === '') return true;
+		if (!this.template) return false;
+		const template = key === null ? this.template.preamble : this.template.sections.find((s) => s.key === key)?.body;
+		return template !== undefined && !template.includes('<%') && template === body;
+	}
+
+	private stack(theirs: string, ours: string): string {
+		const known = new Set(codeBlocks(theirs).map((b) => b.text));
+		const repeated = codeBlocks(ours).filter((b) => known.has(b.text));
+		const oursRest = removeCodeBlocks(ours, repeated).trim();
+		return `${deviceMarker(this.ctx.theirsDevice)}\n${theirs}\n\n${deviceMarker(this.ctx.oursDevice)}\n${oursRest}`;
+	}
 }
 
-/** The GitHub order, with sections only this device has placed after the one they follow here. */
+function byKey(sections: Section[]): Map<string, Section> {
+	return new Map(sections.map((s) => [s.key, s]));
+}
+
+/** The GitHub order, with keys only this device has placed after the one they follow here. */
 function mergeOrder(theirs: string[], ours: string[]): string[] {
 	const order = [...theirs];
 	let previous: string | null = null;
@@ -115,57 +118,41 @@ function mergeOrder(theirs: string[], ours: string[]): string[] {
 	return order;
 }
 
+/** Field by field: the side that changed a field wins; when both did, the GitHub side wins. */
 function mergeFrontmatter(
 	base: Map<string, string> | null,
 	ours: Map<string, string> | null,
 	theirs: Map<string, string> | null,
-	pick: (p: Pick) => void,
 ): Map<string, string> | null {
 	if (!ours && !theirs) return null;
-	const o = ours ?? new Map<string, string>();
-	const t = theirs ?? new Map<string, string>();
-	const b = base ?? new Map<string, string>();
 	const result = new Map<string, string>();
-	for (const key of mergeOrder([...t.keys()], [...o.keys()])) {
-		const ov = o.get(key);
-		const tv = t.get(key);
-		const bv = b.get(key);
-		if (ov === tv) {
-			if (ov !== undefined) result.set(key, ov);
-			continue;
-		}
-		const oursChanged = ov !== bv;
-		const theirsChanged = tv !== bv;
-		let value: string | undefined;
-		if (oursChanged && !theirsChanged) {
-			pick('ours');
-			value = ov;
-		} else {
-			pick(oursChanged ? 'other' : 'theirs');
-			value = tv ?? ov;
-		}
-		if (value !== undefined) result.set(key, value);
+	for (const field of mergeOrder([...(theirs?.keys() ?? [])], [...(ours?.keys() ?? [])])) {
+		const b = base?.get(field);
+		const o = ours?.get(field);
+		const t = theirs?.get(field);
+		const value = t === b ? o : t;
+		if (value !== undefined) result.set(field, value);
 	}
 	return result;
 }
 
-/** Remove copies of fenced code blocks beyond what either side had. */
-function dedupeCodeBlocks(text: string, ours: string, theirs: string): string {
+/** A merge never leaves more copies of a code block than either side had (ADR 0002). */
+function withoutExtraCodeBlocks(text: string, v: NoteVersions): string {
 	const allowed = new Map<string, number>();
-	for (const source of [ours, theirs]) {
-		const counts = new Map<string, number>();
-		for (const b of codeBlocks(source)) counts.set(b.text, (counts.get(b.text) ?? 0) + 1);
-		for (const [k, n] of counts) allowed.set(k, Math.max(allowed.get(k) ?? 0, n));
+	for (const side of [v.ours, v.theirs]) {
+		for (const [block, n] of countBlocks(side)) allowed.set(block, Math.max(allowed.get(block) ?? 0, n));
 	}
 	const seen = new Map<string, number>();
-	const drop: { start: number; end: number }[] = [];
-	for (const b of codeBlocks(text)) {
+	const extra = codeBlocks(text).filter((b) => {
 		const n = (seen.get(b.text) ?? 0) + 1;
 		seen.set(b.text, n);
-		if (n > (allowed.get(b.text) ?? 0)) drop.push(b);
-	}
-	if (!drop.length) return text;
-	const lines = text.split('\n');
-	for (const b of drop.reverse()) lines.splice(b.start, b.end - b.start + 1);
-	return lines.join('\n').replace(/\n{3,}/g, '\n\n');
+		return n > (allowed.get(b.text) ?? 0);
+	});
+	return removeCodeBlocks(text, extra);
+}
+
+function countBlocks(text: string): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const b of codeBlocks(text)) counts.set(b.text, (counts.get(b.text) ?? 0) + 1);
+	return counts;
 }

@@ -11,7 +11,9 @@ Replaces obsidian-git for the journal vault (`github.com/z0rzi/journal`), on the
 | Startup, the app coming back to the foreground, every 10 min | **Pull** |
 | "Sync now" command or the status bar item | **Sync** |
 
-Both intervals are configurable. Only one Sync or Pull runs at a time. A request arriving while one runs is queued once.
+Both intervals are configurable. Only one Sync or Pull runs at a time, the quit-time Sync included. A request arriving while one runs is queued once; a queued Sync replaces a queued Pull.
+
+Before each Sync or Pull, open editors are saved, so the engine sees their text and an editor can't later overwrite a merged file with an older buffer.
 
 ## A Sync
 
@@ -21,15 +23,19 @@ Both intervals are configurable. Only one Sync or Pull runs at a time. A request
 4. Remote is behind: push.
 5. Remote is ahead: fast-forward (see "Applying the other side").
 6. Both moved: merge every file (see "Merging"), write the merge commit with both parents, push.
-7. If the push is rejected because the other Device pushed meanwhile, run the cycle again, at most 3 times.
+7. If the push is rejected because the other Device pushed meanwhile, go back to step 2, at most 3 more times.
 
 ## A Pull
 
-Fetch. If the remote is ahead and there are no local commits waiting, fast-forward without committing pending edits. Files with pending edits that the remote also changed are merged on disk ("Merging" below, with the last commit as the base). If both sides have commits, a full Sync runs instead.
+Fetch, then:
+
+- Remote is ahead: fast-forward without committing pending edits. Files with pending edits that the remote also changed are merged on disk ("Merging" below, with the last commit as the base).
+- Local commits are waiting (an earlier push failed): push them, still without committing pending edits.
+- Both sides have commits: a full Sync runs instead.
 
 ## Applying the other side
 
-For each file the remote changed, read the file on disk just before writing it. If it differs from the version in the last local commit, because the user typed during the Sync, that disk content is merged in rather than overwritten.
+Fast-forward and merge bring files in the same way. For each file the remote changed since the common commit, the three versions are the common commit's, the file on disk now, and the remote's. Using the disk rather than the last commit means text typed during the Sync, or edits a Pull doesn't commit, is merged in rather than overwritten.
 
 ## Merging a file changed on both sides
 
@@ -52,14 +58,15 @@ For each file the remote changed, read the file on disk just before writing it. 
 
 A Section is identified by its heading line. If the same heading appears twice in a note, it is identified by occurrence order. Headings inside fenced code blocks are not headings.
 
-The template for a note is found from Templater's folder templates (`folder_templates` in Templater's settings). A Section is Blank when its trimmed text is empty, or equal to the trimmed text of the same Section in the template. The same goes for the Preamble.
+The template for a note is found from Templater's folder templates (`folder_templates` in Templater's settings). A Section is Blank when its trimmed text is empty, or equal to the trimmed text of the same Section in the template. The same goes for the Preamble. A template Section containing Templater code (`<% … %>`) can render to anything, so a Section matching it is never Blank: otherwise what was written there could be silently replaced by the other side.
 
 The other Device's name is read from the last remote commit message (`sync <device>: …`), and is "other device" if it can't be read.
 
 ## Feedback
 
-- A status bar item shows the last sync time, "syncing…", "offline" or "error". Clicking it runs a Sync.
-- A notice lists the files after an automatic merge that Stacked something, so you can check them.
+- A status bar item shows "waiting" until the first job, then the last Sync or Pull time, "syncing…", "offline" or "error" (the message is in its tooltip). Clicking it runs a Sync. A "Sync now" command does the same.
+- A notice that stays until dismissed lists the files where something was Stacked, and the conflict copies written, so you can check them.
+- An error shows a notice once; the same error again stays in the status bar only.
 - Being offline is not an error: the next trigger retries.
 
 ## Settings, per Device

@@ -30,7 +30,7 @@ function count(haystack: string, needle: string): number {
 }
 
 describe('mergeNote', () => {
-	it('combines edits made in different places without stacking', () => {
+	it('merges edits made in different places without stacking', () => {
 		const base = 'a\nb\nc\nd\ne\n';
 		const result = mergeNote({ base, ours: 'A\nb\nc\nd\ne\n', theirs: 'a\nb\nc\nd\nE\n' }, ctx);
 		expect(result).toEqual({ text: 'A\nb\nc\nd\nE\n', stacked: false });
@@ -124,6 +124,35 @@ Good dinner.
 		const result = mergeNote({ base, ours, theirs }, ctx);
 		expect(count(result.text, '## A')).toBe(1);
 		expect(count(result.text, '# comment')).toBe(1);
+	});
+
+	it('never duplicates a code block, even when the line merge is clean', () => {
+		const base = 'a\nb\nc\nd\ne\nf\n';
+		const block = '```tasks\nGET\n```\n';
+		const ours = `${block}a\nb\nc\nd\ne\nf\n`;
+		const theirs = `a\nb\nc\nd\ne\nf\n${block}`;
+		const result = mergeNote({ base, ours, theirs }, ctx);
+		expect(count(result.text, '```tasks')).toBe(1);
+	});
+
+	it('drops a frontmatter field the GitHub side deleted and this device left alone', () => {
+		const base = '---\na: 1\nb: 2\n---\n\n## X\nbase\n';
+		const ours = '---\na: 1\nb: 2\n---\n\n## X\nmine\n';
+		const theirs = '---\na: 1\n---\n\n## X\ntheirs\n';
+		const result = mergeNote({ base, ours, theirs }, ctx);
+		expect(result.text.startsWith('---\na: 1\n---\n')).toBe(true);
+	});
+
+	it('never treats a template section holding Templater code as blank', () => {
+		const template = '## Roles\n<%* tR += "**Role** — " %>\n\n## The week\n_Three lines._\n';
+		const ours = '## Roles\n**Writer** — wrote two pages\n\n## The week\n_Three lines._\n';
+		const theirs = '## Roles\n**Writer** — \n\n## The week\nCalm week.\n';
+		const result = mergeNote(
+			{ base: null, ours, theirs },
+			{ template, oursDevice: 'Phone', theirsDevice: 'Desktop' },
+		);
+		expect(result.text).toContain('wrote two pages');
+		expect(result.text).toContain('Calm week.');
 	});
 
 	it('keeps an edit over a deletion', () => {
