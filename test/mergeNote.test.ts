@@ -155,6 +155,21 @@ Good dinner.
 		expect(result.text).toContain('Calm week.');
 	});
 
+	it('does not bring back template sections the real note no longer has', () => {
+		const real = FRESH.replace('*Random thoughts, can stay empty*', 'Slept badly.')
+			.replace('## What are we doing today?\n*Drop a list of ideas or plans*\n\n', '')
+			.replace('## A few thoughts about yesterday\n', '');
+		const result = mergeNote({ base: null, ours: FRESH, theirs: real }, ctx);
+		expect(result).toEqual({ text: real, stacked: false });
+	});
+
+	it('keeps a heading this device added, even with nothing under it yet', () => {
+		const base = '## One\n1\n';
+		const ours = '## One\nmine\n\n## New\n';
+		const theirs = '## One\ntheirs\n';
+		expect(mergeNote({ base, ours, theirs }, ctx).text).toContain('## New');
+	});
+
 	it('keeps an edit over a deletion', () => {
 		const base = '## A\n1\n\n## B\n2\n';
 		const ours = '## A\n1\n';

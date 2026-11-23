@@ -50,7 +50,7 @@ Fast-forward and merge bring files in the same way. For each file the remote cha
        1. Both versions identical: keep it.
        2. One side **Blank**: take the other.
        3. One side unchanged since the base: take the other.
-       4. Deleted on one side and unchanged on the other: drop it. Edited on the other side: keep the edit.
+       4. On one side only. Deleted on the other: dropped if unchanged since the base, kept if edited. Added (not in the base): kept, unless its text is exactly the template's, which means the other side removed that template Section.
        5. Line-by-line merge of the Section is clean: use it.
        6. Otherwise **Stack**: the GitHub version first, then the local one, each preceded by its **Device marker** `*— <device> —*`. Fenced code blocks of the second version that already appear in the first are left out.
      - Section order follows the GitHub version. Sections only the local side has are inserted after the Section that precedes them locally.

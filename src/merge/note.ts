@@ -73,8 +73,11 @@ class SectionMerger {
 	private mergeBody(key: string | null, { base, ours, theirs }: Versions<string | undefined>): string | undefined {
 		if (ours === theirs) return theirs;
 		if (ours === undefined || theirs === undefined) {
-			// Deleted on one side: the deletion wins only over an unchanged Section.
-			const kept = ours ?? theirs;
+			// On one side only. Deleted on the other: the deletion wins only over an
+			// unchanged Section. Added: kept, unless it is just the template's text,
+			// which the other side has removed.
+			const kept = (ours ?? theirs) as string;
+			if (base === undefined) return this.isTemplateText(key, kept) ? undefined : kept;
 			return kept === base ? undefined : kept;
 		}
 		if (this.isBlank(key, ours)) return theirs;
@@ -87,11 +90,14 @@ class SectionMerger {
 		return this.stack(theirs, ours);
 	}
 
-	/** Empty, or still exactly the template's text. Templater code can't be matched, so it never is. */
+	/** Empty, or still exactly the template's text. */
 	private isBlank(key: string | null, body: string): boolean {
-		if (body === '') return true;
-		if (!this.template) return false;
-		const template = key === null ? this.template.preamble : this.template.sections.find((s) => s.key === key)?.body;
+		return body === '' || this.isTemplateText(key, body);
+	}
+
+	/** The template has this Section with exactly this text. Templater code can't be matched, so it never does. */
+	private isTemplateText(key: string | null, body: string): boolean {
+		const template = key === null ? this.template?.preamble : this.template?.sections.find((s) => s.key === key)?.body;
 		return template !== undefined && !template.includes('<%') && template === body;
 	}
 
